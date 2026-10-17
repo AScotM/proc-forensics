@@ -2,31 +2,45 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"math"
 	"os"
+	"os/signal"
 	"os/user"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
-const version = "1.0.1"
+const version = "2.0.0"
 
 type Config struct {
-	JSON        bool
-	ProcRoot    string
-	ShowEnv     bool
-	ShowMaps    bool
-	ShowFDs     bool
-	ShowThreads bool
-	Version     bool
-	PID         int
+	JSON          bool
+	ProcRoot      string
+	ShowEnv       bool
+	ShowMaps      bool
+	ShowFDs       bool
+	ShowThreads   bool
+	Version       bool
+	Watch         time.Duration
+	Count         int
+	Output        string
+	Compare       string
+	Save          string
+	Tree          bool
+	SecurityAudit bool
+	RevealSecrets bool
+	ClockTicks    uint64
+	PID           int
 }
 
 type Identity struct {
@@ -57,6 +71,7 @@ type CPUInfo struct {
 	ChildrenUser   int64   `json:"children_user_ticks"`
 	ChildrenSystem int64   `json:"children_system_ticks"`
 	StartTicks     uint64  `json:"start_ticks"`
+	ClockTicks     uint64  `json:"clock_ticks_per_second"`
 	Priority       int64   `json:"priority"`
 	Nice           int64   `json:"nice"`
 	Processor      int64   `json:"processor"`
@@ -202,6 +217,9 @@ type ProcessDossier struct {
 	Environment  EnvironmentInfo `json:"environment"`
 	Limits       LimitsInfo      `json:"limits"`
 	Warnings     []string        `json:"warnings,omitempty"`
+	Ancestry     []Ancestor      `json:"ancestry,omitempty"`
+	Audit        []Finding       `json:"audit,omitempty"`
+	Collection   CollectionInfo  `json:"collection"`
 }
 
 type StatusData struct {
@@ -242,21 +260,10 @@ func main() {
 		return
 	}
 
-	dossier, err := inspectProcess(config)
-	if err != nil {
+	if err := run(config); err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
 	}
-
-	if config.JSON {
-		if err := printJSON(dossier); err != nil {
-			fmt.Fprintln(os.Stderr, "Error:", err)
-			os.Exit(1)
-		}
-		return
-	}
-
-	printHuman(dossier)
 }
 
 func parseFlags() (Config, error) {
@@ -269,6 +276,15 @@ func parseFlags() (Config, error) {
 	flag.BoolVar(&config.ShowFDs, "fds", false, "")
 	flag.BoolVar(&config.ShowThreads, "threads", false, "")
 	flag.BoolVar(&config.Version, "version", false, "")
+	flag.DurationVar(&config.Watch, "watch", 0, "")
+	flag.IntVar(&config.Count, "count", 0, "")
+	flag.StringVar(&config.Output, "output", "", "")
+	flag.StringVar(&config.Compare, "compare", "", "")
+	flag.StringVar(&config.Save, "save", "", "")
+	flag.BoolVar(&config.Tree, "tree", false, "")
+	flag.BoolVar(&config.SecurityAudit, "audit", false, "")
+	flag.BoolVar(&config.RevealSecrets, "reveal-secrets", false, "")
+	flag.Uint64Var(&config.ClockTicks, "ticks", 100, "")
 
 	flag.Usage = func() {
 		name := filepath.Base(os.Args[0])
@@ -285,7 +301,16 @@ func parseFlags() (Config, error) {
 		fmt.Fprintf(os.Stderr, "  --threads    Include individual thread details\n")
 		fmt.Fprintf(os.Stderr, "  --proc PATH  Alternate procfs root\n")
 		fmt.Fprintf(os.Stderr, "  --version    Show version\n")
-		fmt.Fprintf(os.Stderr, "  --help       Show help\n\n")
+		fmt.Fprintf(os.Stderr, "  --watch DURATION   Monitor continuously, e.g. 2s\n")
+		fmt.Fprintf(os.Stderr, "  --count N          Stop after N samples\n")
+		fmt.Fprintf(os.Stderr, "  --output PATH      Write output to file\n")
+		fmt.Fprintf(os.Stderr, "  --save PATH        Save snapshot as JSON\n")
+		fmt.Fprintf(os.Stderr, "  --compare PATH     Compare with saved snapshot\n")
+		fmt.Fprintf(os.Stderr, "  --tree             Include process ancestry\n")
+		fmt.Fprintf(os.Stderr, "  --audit            Evaluate security posture\n")
+		fmt.Fprintf(os.Stderr, "  --reveal-secrets   Show environment values without redaction\n")
+		fmt.Fprintf(os.Stderr, "  --ticks N          Kernel clock ticks per second (default 100)\n")
+		fmt.Fprintf(os.Stderr, "  --help             Show help\n\n")
 		fmt.Fprintf(os.Stderr, "Examples:\n")
 		fmt.Fprintf(os.Stderr, "  %s 1\n", name)
 		fmt.Fprintf(os.Stderr, "  %s self\n", name)
@@ -316,6 +341,18 @@ func parseFlags() (Config, error) {
 		config.PID = pid
 	}
 
+	if config.Watch < 0 || (config.Watch > 0 && config.Watch < 100*time.Millisecond) {
+		return config, errors.New("--watch must be at least 100ms")
+	}
+	if config.Count < 0 {
+		return config, errors.New("--count cannot be negative")
+	}
+	if config.ClockTicks == 0 {
+		return config, errors.New("--ticks must be positive")
+	}
+	if config.Watch == 0 && config.Count > 1 {
+		return config, errors.New("--count greater than one requires --watch")
+	}
 	if config.ProcRoot == "" {
 		return config, errors.New("procfs root cannot be empty")
 	}
@@ -349,7 +386,7 @@ func inspectProcess(config Config) (ProcessDossier, error) {
 	kernel := readTrimmed(filepath.Join(config.ProcRoot, "sys", "kernel", "osrelease"))
 
 	dossier.Version = version
-	dossier.Timestamp = time.Now().Format(time.RFC3339)
+	dossier.Timestamp = time.Now().Format(time.RFC3339Nano)
 	dossier.Hostname = fallback(hostname, "unknown")
 	dossier.Kernel = fallback(kernel, "unknown")
 	dossier.Architecture = runtime.GOARCH
@@ -416,13 +453,26 @@ func inspectProcess(config Config) (ProcessDossier, error) {
 	}
 
 	if environment, err := readEnvironment(filepath.Join(processRoot, "environ"), config.ShowEnv); err == nil {
+		if !config.RevealSecrets {
+			redactEnvironment(&environment)
+		}
 		dossier.Environment = environment
 	} else {
 		dossier.Warnings = append(dossier.Warnings, "environment unavailable: "+err.Error())
 	}
 
+	if config.Tree {
+		dossier.Ancestry = collectAncestry(config.ProcRoot, stat.PPID, 64)
+	}
+	if config.SecurityAudit {
+		dossier.Audit = evaluateSecurity(dossier)
+	}
+	endStat, endErr := readStat(filepath.Join(processRoot, "stat"))
+	if endErr != nil || endStat.StartTicks != stat.StartTicks {
+		return dossier, errors.New("process identity changed or disappeared during inspection")
+	}
+	dossier.Collection = CollectionInfo{ProcessStartTicks: stat.StartTicks, Complete: len(dossier.Warnings) == 0, WarningCount: len(dossier.Warnings)}
 	sort.Strings(dossier.Warnings)
-
 	return dossier, nil
 }
 
@@ -534,7 +584,7 @@ func buildIdentity(config Config, status StatusData, stat StatData) Identity {
 
 func buildCPU(config Config, status StatusData, stat StatData) CPUInfo {
 	uptime := readUptime(filepath.Join(config.ProcRoot, "uptime"))
-	ticks := clockTicks()
+	ticks := config.ClockTicks
 
 	startSeconds := float64(stat.StartTicks) / float64(ticks)
 	elapsed := uptime - startSeconds
@@ -549,6 +599,7 @@ func buildCPU(config Config, status StatusData, stat StatData) CPUInfo {
 		ChildrenUser:   stat.ChildrenUser,
 		ChildrenSystem: stat.ChildrenSystem,
 		StartTicks:     stat.StartTicks,
+		ClockTicks:     ticks,
 		Priority:       stat.Priority,
 		Nice:           stat.Nice,
 		Processor:      stat.Processor,
@@ -733,7 +784,7 @@ func readFDs(processRoot string, includeEntries bool) (FDSummary, map[uint64]int
 			continue
 		}
 
-		fdType := classifyFD(target)
+		fdType := classifyFDPath(filepath.Join(path, entry.Name()), target)
 		summary.Total++
 
 		switch fdType {
@@ -768,6 +819,28 @@ func readFDs(processRoot string, includeEntries bool) (FDSummary, map[uint64]int
 	})
 
 	return summary, socketInodes, nil
+}
+
+func classifyFDPath(fdPath, target string) string {
+	switch {
+	case strings.HasPrefix(target, "socket:["):
+		return "socket"
+	case strings.HasPrefix(target, "pipe:["):
+		return "pipe"
+	case strings.HasPrefix(target, "anon_inode:"):
+		return "anon_inode"
+	}
+	info, err := os.Stat(fdPath)
+	if err != nil {
+		return "other"
+	}
+	if info.IsDir() {
+		return "directory"
+	}
+	if info.Mode().IsRegular() {
+		return "file"
+	}
+	return "other"
 }
 
 func classifyFD(target string) string {
@@ -1282,9 +1355,7 @@ func readUptime(path string) float64 {
 	return value
 }
 
-func clockTicks() uint64 {
-	return 100
-}
+func clockTicks() uint64 { return 100 }
 
 func parseIDSet(value string) [4]uint64 {
 	var result [4]uint64
@@ -1691,4 +1762,371 @@ func formatLimit(value uint64) string {
 	}
 
 	return strconv.FormatUint(value, 10)
+}
+
+type CollectionInfo struct {
+	ProcessStartTicks uint64 `json:"process_start_ticks"`
+	Complete          bool   `json:"complete"`
+	WarningCount      int    `json:"warning_count"`
+}
+
+type Ancestor struct {
+	PID        int    `json:"pid"`
+	PPID       int    `json:"ppid"`
+	Name       string `json:"name"`
+	State      string `json:"state"`
+	StartTicks uint64 `json:"start_ticks"`
+}
+
+type Finding struct {
+	ID       string `json:"id"`
+	Severity string `json:"severity"`
+	Summary  string `json:"summary"`
+	Evidence string `json:"evidence,omitempty"`
+}
+
+type NumericChange struct {
+	Before uint64  `json:"before"`
+	After  uint64  `json:"after"`
+	Delta  int64   `json:"delta"`
+	Rate   float64 `json:"rate_per_second,omitempty"`
+}
+
+type ProcessDelta struct {
+	Version            string        `json:"version"`
+	Timestamp          string        `json:"timestamp"`
+	PID                int           `json:"pid"`
+	SameProcess        bool          `json:"same_process"`
+	DurationSeconds    float64       `json:"duration_seconds"`
+	CPUUserTicks       NumericChange `json:"cpu_user_ticks"`
+	CPUSystemTicks     NumericChange `json:"cpu_system_ticks"`
+	ResidentBytes      NumericChange `json:"resident_bytes"`
+	VirtualBytes       NumericChange `json:"virtual_bytes"`
+	ReadBytes          NumericChange `json:"read_bytes"`
+	WriteBytes         NumericChange `json:"write_bytes"`
+	ReadSyscalls       NumericChange `json:"read_syscalls"`
+	WriteSyscalls      NumericChange `json:"write_syscalls"`
+	ContextVoluntary   NumericChange `json:"voluntary_context_switches"`
+	ContextInvoluntary NumericChange `json:"involuntary_context_switches"`
+	FDCount            NumericChange `json:"fd_count"`
+	Threads            NumericChange `json:"threads"`
+	SocketCount        NumericChange `json:"socket_count"`
+	CPUPercent         float64       `json:"cpu_percent_one_core"`
+	Warnings           []string      `json:"warnings,omitempty"`
+}
+
+type Envelope struct {
+	Type     string         `json:"type"`
+	Sequence int            `json:"sequence"`
+	Snapshot ProcessDossier `json:"snapshot"`
+	Delta    *ProcessDelta  `json:"delta,omitempty"`
+}
+
+var secretPattern = regexp.MustCompile(`(?i)(password|passwd|token|secret|credential|api[_-]?key|private[_-]?key|authorization|cookie|session|access[_-]?key|client[_-]?secret)`)
+
+func redactEnvironment(info *EnvironmentInfo) {
+	for key := range info.Variables {
+		if secretPattern.MatchString(key) {
+			info.Variables[key] = "[REDACTED]"
+		}
+	}
+}
+
+func collectAncestry(root string, parent, limit int) []Ancestor {
+	result := make([]Ancestor, 0)
+	seen := make(map[int]bool)
+	for parent > 0 && len(result) < limit {
+		if seen[parent] {
+			break
+		}
+		seen[parent] = true
+		base := filepath.Join(root, strconv.Itoa(parent))
+		stat, err := readStat(filepath.Join(base, "stat"))
+		if err != nil {
+			break
+		}
+		status, err := readStatus(filepath.Join(base, "status"))
+		if err != nil {
+			break
+		}
+		result = append(result, Ancestor{
+			PID: parent, PPID: stat.PPID, Name: status.Values["Name"],
+			State: status.Values["State"], StartTicks: stat.StartTicks,
+		})
+		if stat.PPID == parent {
+			break
+		}
+		parent = stat.PPID
+	}
+	return result
+}
+
+func evaluateSecurity(d ProcessDossier) []Finding {
+	findings := make([]Finding, 0)
+	add := func(id, severity, summary, evidence string) {
+		findings = append(findings, Finding{ID: id, Severity: severity, Summary: summary, Evidence: evidence})
+	}
+	if d.Security.Seccomp == 0 {
+		add("SECCOMP_DISABLED", "info", "No seccomp filtering detected", "Seccomp=0")
+	} else if d.Security.Seccomp == 2 {
+		add("SECCOMP_FILTER", "info", "Seccomp filter active", strconv.Itoa(d.Security.SeccompFilters))
+	}
+	if !d.Security.NoNewPrivileges {
+		add("PRIVILEGE_ESCALATION", "info", "NoNewPrivileges is not enabled", "NoNewPrivs=0")
+	}
+	if d.Identity.UIDEffective == 0 {
+		add("ROOT_PROCESS", "info", "Process has effective root identity", "euid=0")
+	}
+	if d.Security.TracerPID != 0 {
+		add("TRACED_PROCESS", "notice", "Process is being traced", strconv.Itoa(d.Security.TracerPID))
+	}
+	if d.Security.CoreDumping {
+		add("CORE_DUMPING", "notice", "Process is currently dumping core", "CoreDumping=1")
+	}
+	if d.Security.SELinuxContext == "unavailable" {
+		add("SELINUX_UNKNOWN", "info", "SELinux context is unavailable", "")
+	}
+	if d.Maps.Deleted > 0 {
+		add("DELETED_MAPPINGS", "notice", "Process maps deleted files", strconv.Itoa(d.Maps.Deleted))
+	}
+	if d.FDs.LimitSoft > 0 && d.FDs.LimitSoft != ^uint64(0) && uint64(d.FDs.Total)*100 >= d.FDs.LimitSoft*90 {
+		add("FD_PRESSURE", "notice", "Open file descriptors approach soft limit", fmt.Sprintf("%d/%d", d.FDs.Total, d.FDs.LimitSoft))
+	}
+	sort.Slice(findings, func(i, j int) bool { return findings[i].ID < findings[j].ID })
+	return findings
+}
+
+func unsignedChange(before, after uint64, seconds float64) NumericChange {
+	var difference int64
+	if after >= before {
+		diff := after - before
+		if diff > math.MaxInt64 {
+			difference = math.MaxInt64
+		} else {
+			difference = int64(diff)
+		}
+	} else {
+		diff := before - after
+		if diff > math.MaxInt64 {
+			difference = math.MinInt64
+		} else {
+			difference = -int64(diff)
+		}
+	}
+	result := NumericChange{Before: before, After: after, Delta: difference}
+	if seconds > 0 {
+		result.Rate = float64(difference) / seconds
+	}
+	return result
+}
+
+func compareDossiers(before, after ProcessDossier) ProcessDelta {
+	delta := ProcessDelta{Version: version, Timestamp: after.Timestamp, PID: after.Identity.PID}
+	delta.SameProcess = before.Identity.PID == after.Identity.PID && before.CPU.StartTicks == after.CPU.StartTicks && before.CPU.StartTicks != 0
+	oldTime, oldErr := time.Parse(time.RFC3339Nano, before.Timestamp)
+	newTime, newErr := time.Parse(time.RFC3339Nano, after.Timestamp)
+	if oldErr == nil && newErr == nil {
+		delta.DurationSeconds = newTime.Sub(oldTime).Seconds()
+	}
+	if !delta.SameProcess {
+		delta.Warnings = append(delta.Warnings, "snapshots do not describe the same process instance")
+		return delta
+	}
+	seconds := delta.DurationSeconds
+	delta.CPUUserTicks = unsignedChange(before.CPU.UserTicks, after.CPU.UserTicks, seconds)
+	delta.CPUSystemTicks = unsignedChange(before.CPU.SystemTicks, after.CPU.SystemTicks, seconds)
+	delta.ResidentBytes = unsignedChange(before.Memory.ResidentBytes, after.Memory.ResidentBytes, seconds)
+	delta.VirtualBytes = unsignedChange(before.Memory.VirtualBytes, after.Memory.VirtualBytes, seconds)
+	delta.ReadBytes = unsignedChange(before.IO.ReadBytes, after.IO.ReadBytes, seconds)
+	delta.WriteBytes = unsignedChange(before.IO.WriteBytes, after.IO.WriteBytes, seconds)
+	delta.ReadSyscalls = unsignedChange(before.IO.ReadSyscalls, after.IO.ReadSyscalls, seconds)
+	delta.WriteSyscalls = unsignedChange(before.IO.WriteSyscalls, after.IO.WriteSyscalls, seconds)
+	delta.ContextVoluntary = unsignedChange(before.CPU.VoluntaryCS, after.CPU.VoluntaryCS, seconds)
+	delta.ContextInvoluntary = unsignedChange(before.CPU.InvoluntaryCS, after.CPU.InvoluntaryCS, seconds)
+	delta.FDCount = unsignedChange(uint64(before.FDs.Total), uint64(after.FDs.Total), seconds)
+	delta.Threads = unsignedChange(uint64(before.CPU.Threads), uint64(after.CPU.Threads), seconds)
+	delta.SocketCount = unsignedChange(uint64(before.FDs.Sockets), uint64(after.FDs.Sockets), seconds)
+	if seconds > 0 && after.CPU.ClockTicks > 0 {
+		delta.CPUPercent = float64(delta.CPUUserTicks.Delta+delta.CPUSystemTicks.Delta) / float64(after.CPU.ClockTicks) / seconds * 100
+	}
+	if delta.ReadBytes.Delta < 0 || delta.WriteBytes.Delta < 0 {
+		delta.Warnings = append(delta.Warnings, "I/O counters decreased; rates may be unreliable")
+	}
+	return delta
+}
+
+func loadDossier(path string) (ProcessDossier, error) {
+	var d ProcessDossier
+	f, err := os.Open(path)
+	if err != nil {
+		return d, err
+	}
+	defer f.Close()
+	decoder := json.NewDecoder(f)
+	if err := decoder.Decode(&d); err != nil {
+		return d, err
+	}
+	if d.Identity.PID <= 0 {
+		return d, errors.New("snapshot lacks valid process identity")
+	}
+	return d, nil
+}
+
+func saveDossier(path string, d ProcessDossier) error {
+	data, err := json.MarshalIndent(d, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	temp, err := os.CreateTemp(filepath.Dir(path), ".proc-forensics-*")
+	if err != nil {
+		return err
+	}
+	name := temp.Name()
+	defer os.Remove(name)
+	if err := temp.Chmod(0600); err != nil {
+		temp.Close()
+		return err
+	}
+	if _, err := temp.Write(data); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(name, path)
+}
+
+func renderDelta(w *bufio.Writer, d ProcessDelta) error {
+	fmt.Fprintf(w, "Process Forensics Delta\n=======================\n")
+	fmt.Fprintf(w, "PID: %d\nSame process: %t\nInterval: %.3f s\n", d.PID, d.SameProcess, d.DurationSeconds)
+	if !d.SameProcess {
+		return w.Flush()
+	}
+	fmt.Fprintf(w, "CPU: %.2f%% of one logical CPU\n", d.CPUPercent)
+	fmt.Fprintf(w, "RSS change: %+d bytes\n", d.ResidentBytes.Delta)
+	fmt.Fprintf(w, "Virtual memory change: %+d bytes\n", d.VirtualBytes.Delta)
+	fmt.Fprintf(w, "Read: %+d bytes (%.2f B/s)\n", d.ReadBytes.Delta, d.ReadBytes.Rate)
+	fmt.Fprintf(w, "Write: %+d bytes (%.2f B/s)\n", d.WriteBytes.Delta, d.WriteBytes.Rate)
+	fmt.Fprintf(w, "Read syscalls: %+d\nWrite syscalls: %+d\n", d.ReadSyscalls.Delta, d.WriteSyscalls.Delta)
+	fmt.Fprintf(w, "File descriptors: %+d\nThreads: %+d\nSockets: %+d\n", d.FDCount.Delta, d.Threads.Delta, d.SocketCount.Delta)
+	for _, warning := range d.Warnings {
+		fmt.Fprintf(w, "Warning: %s\n", warning)
+	}
+	return w.Flush()
+}
+
+func emitJSON(w *bufio.Writer, v any) error {
+	encoder := json.NewEncoder(w)
+	if err := encoder.Encode(v); err != nil {
+		return err
+	}
+	return w.Flush()
+}
+
+func renderSnapshot(w *bufio.Writer, d ProcessDossier) error {
+	fmt.Fprintf(w, "Process Forensics %s\n", d.Version)
+	fmt.Fprintf(w, "PID: %d  PPID: %d  Name: %s  State: %s\n", d.Identity.PID, d.Identity.PPID, d.Identity.Name, d.Identity.State)
+	fmt.Fprintf(w, "User: %s  Command: %s\n", d.Identity.User, d.Identity.Command)
+	fmt.Fprintf(w, "RSS: %s  Virtual: %s  Threads: %d\n", formatBytes(d.Memory.ResidentBytes), formatBytes(d.Memory.VirtualBytes), d.CPU.Threads)
+	fmt.Fprintf(w, "I/O read: %s  write: %s\n", formatBytes(d.IO.ReadBytes), formatBytes(d.IO.WriteBytes))
+	fmt.Fprintf(w, "FDs: %d  Sockets: %d  Namespaces: %d\n", d.FDs.Total, d.FDs.Sockets, len(d.Namespaces))
+	fmt.Fprintf(w, "SELinux: %s  Seccomp: %s\n", d.Security.SELinuxContext, seccompName(d.Security.Seccomp))
+	for _, a := range d.Ancestry {
+		fmt.Fprintf(w, "Ancestor: %d <- %d %s\n", a.PID, a.PPID, a.Name)
+	}
+	for _, finding := range d.Audit {
+		fmt.Fprintf(w, "Audit [%s] %s: %s\n", finding.Severity, finding.ID, finding.Summary)
+	}
+	for _, warning := range d.Warnings {
+		fmt.Fprintf(w, "Warning: %s\n", warning)
+	}
+	return w.Flush()
+}
+
+func run(config Config) error {
+	var out *os.File = os.Stdout
+	if config.Output != "" {
+		f, err := os.OpenFile(config.Output, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		out = f
+	}
+	writer := bufio.NewWriter(out)
+	var previous *ProcessDossier
+	if config.Compare != "" {
+		loaded, err := loadDossier(config.Compare)
+		if err != nil {
+			return err
+		}
+		previous = &loaded
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	sequence := 0
+	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+		dossier, err := inspectProcess(config)
+		if err != nil {
+			return err
+		}
+		sequence++
+		var change *ProcessDelta
+		if previous != nil {
+			d := compareDossiers(*previous, dossier)
+			change = &d
+		}
+		if config.JSON {
+			if config.Watch > 0 {
+				if err := emitJSON(writer, Envelope{Type: "process_sample", Sequence: sequence, Snapshot: dossier, Delta: change}); err != nil {
+					return err
+				}
+			} else if change != nil {
+				if err := emitJSON(writer, Envelope{Type: "process_comparison", Sequence: sequence, Snapshot: dossier, Delta: change}); err != nil {
+					return err
+				}
+			} else if err := emitJSON(writer, dossier); err != nil {
+				return err
+			}
+		} else {
+			if config.Watch == 0 && change == nil && config.Output == "" {
+				printHuman(dossier)
+			} else {
+				fmt.Fprintf(writer, "\nSample %d at %s\n", sequence, dossier.Timestamp)
+				if err := renderSnapshot(writer, dossier); err != nil {
+					return err
+				}
+				if change != nil {
+					if err := renderDelta(writer, *change); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		if config.Save != "" {
+			if err := saveDossier(config.Save, dossier); err != nil {
+				return err
+			}
+		}
+		if config.Watch == 0 || (config.Count > 0 && sequence >= config.Count) {
+			return writer.Flush()
+		}
+		previous = &dossier
+		timer := time.NewTimer(config.Watch)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil
+		case <-timer.C:
+		}
+	}
 }
